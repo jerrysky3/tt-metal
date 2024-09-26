@@ -172,6 +172,7 @@ set(ALL_TTNN_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/matmul/group_attn_matmul/group_attn_matmul.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/matmul/group_attn_matmul/device/group_attn_matmul_device_operation.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/matmul/group_attn_matmul/device/group_attn_matmul_program_factory.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/data_movement/concat/concat.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/reduction/argmax/argmax.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/reduction/fast_reduce_nc/device/fast_reduce_nc_device_operation.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/reduction/fast_reduce_nc/device/fast_reduce_nc_program_factory.cpp
@@ -295,6 +296,8 @@ set(ALL_TTNN_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/upsample/device/upsample_program_factory_singlecore.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/upsample/upsample.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/pool/upsample/upsample_pybind.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/data_movement/concat/device/concat_device_operation.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/experimental/data_movement/concat/device/concat_program_factory.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/reduction/argmax/device/argmax_op.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/reduction/argmax/device/argmax_program_factory.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/ttnn/operations/reduction/argmax/argmax.cpp
