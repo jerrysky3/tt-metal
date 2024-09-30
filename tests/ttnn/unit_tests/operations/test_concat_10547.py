@@ -2,8 +2,8 @@ import torch
 import ttnn
 
 
-def main(device):
-    input_data = torch.randn([1, 1, 32, 32], dtype=torch.bfloat16)
+def gen_data(shape, strategy):
+    input_data = torch.randn(shape, dtype=torch.bfloat16)
     x = ttnn.from_torch(
         input_data,
         device=device,
@@ -14,31 +14,54 @@ def main(device):
     input_shard_config = ttnn.create_sharded_memory_config(
         shape=x.shape,
         core_grid=ttnn.CoreGrid(y=2, x=1),
-        strategy=ttnn.ShardStrategy.WIDTH,
+        strategy=strategy,
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=False,
     )
-    x_t = ttnn.to_memory_config(x, memory_config=input_shard_config, dtype=ttnn.bfloat16)
+    return input_data, ttnn.to_memory_config(x, memory_config=input_shard_config, dtype=ttnn.bfloat16)
 
+
+def main_width(device):
+    input_data_0, x_0 = gen_data([1, 1, 8, 32], ttnn.ShardStrategy.WIDTH)
+    input_data_1, x_1 = gen_data([1, 1, 23, 32], ttnn.ShardStrategy.WIDTH)
     output_shard_config = ttnn.create_sharded_memory_config(
-        shape=[1, 1, 64, 32],
+        shape=[1, 1, 31, 32],
         core_grid=ttnn.CoreGrid(y=2, x=1),
         strategy=ttnn.ShardStrategy.WIDTH,
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=False,
     )
-    y_t = ttnn.experimental.concat([x_t, x_t], dim=2, memory_config=output_shard_config)
+    y_t = ttnn.experimental.concat([x_0, x_1], dim=2, memory_config=output_shard_config)
     output_data = ttnn.to_torch(y_t)
 
-    print(input_data, input_data.shape)
+    print(input_data_0, input_data_0.shape)
     print(output_data, output_data.shape)
-    print(torch.allclose(torch.concat([input_data, input_data], dim=2), output_data))
+    print(torch.allclose(torch.concat([input_data_0, input_data_1], dim=2), output_data))
+
+
+def main_height(device):
+    input_data_0, x_0 = gen_data([1, 1, 32, 32], ttnn.ShardStrategy.HEIGHT)
+    input_data_1, x_1 = gen_data([1, 1, 32, 64], ttnn.ShardStrategy.HEIGHT)
+    output_shard_config = ttnn.create_sharded_memory_config(
+        shape=[1, 1, 32, 96],
+        core_grid=ttnn.CoreGrid(y=2, x=1),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=False,
+    )
+    y_t = ttnn.experimental.concat([x_0, x_1], dim=3, memory_config=output_shard_config)
+    output_data = ttnn.to_torch(y_t)
+
+    print(input_data_0, input_data_0.shape)
+    print(output_data, output_data.shape)
+    print(torch.allclose(torch.concat([input_data_0, input_data_1], dim=3), output_data))
 
 
 if __name__ == "__main__":
     device_id = 1
     device = ttnn.open_device(device_id=device_id)
     try:
-        main(device)
+        main_width(device)
+        main_height(device)
     finally:
         ttnn.close_device(device)

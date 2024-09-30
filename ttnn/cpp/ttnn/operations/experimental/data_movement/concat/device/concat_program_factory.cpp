@@ -20,118 +20,109 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
     const bool is_height_concat = dim == 2;
 
     tt_metal::Program program = tt_metal::CreateProgram();
-
     tt_metal::Device *device = output.device();
 
-    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
-    uint32_t num_cores_x = compute_with_storage_grid_size.x;
-    uint32_t num_cores_y = compute_with_storage_grid_size.y;
-
-    uint32_t num_output_rows = output.get_legacy_shape()[-2];
-    uint32_t num_input_tensors = input_tensors.size();
+    const uint32_t num_input_tensors = input_tensors.size();
+    const uint32_t cb_dst_id = 16;
+    TT_FATAL(num_input_tensors <= cb_dst_id, "Not enough circuit buffer for {} inputs.", num_input_tensors);
+    // TODO(#TODO): Calculate the gcd page size.
+    const uint32_t page_size = 32;
+    const uint32_t element_size = output.element_size();
+    const uint32_t elements_per_page = page_size / element_size;
 
     vector<CBHandle> cb_input(num_input_tensors);
-    vector<uint32_t> input_num_units_per_shard_height(num_input_tensors);
-    vector<uint32_t> input_num_units_per_shard_width(num_input_tensors);
-
-    tt::DataFormat cb_data_format = tt_metal::datatype_to_dataformat_converter(output.get_dtype());
-    auto all_cores = input_tensors[0].shard_spec().value().grid;
-
     vector<uint32_t> cb_ids(num_input_tensors);
-    uint32_t input_unit_size = input_tensors[0].shard_spec().value().shape[1] * input_tensors[0].element_size();
+    vector<uint32_t> input_num_pages_per_stick(num_input_tensors);
+    vector<uint32_t> input_num_sticks(num_input_tensors);
+    vector<uint32_t> input_write_offsets(num_input_tensors);
 
-    log_info("input_unit_size: {}", input_unit_size);
+    const tt::DataFormat cb_data_format = tt_metal::datatype_to_dataformat_converter(output.get_dtype());
+    const auto all_cores = input_tensors[0].shard_spec().value().grid;
 
     // input CBs
+    uint32_t curr_input_write_offset = 0;
     for (uint32_t input_id = 0; input_id < num_input_tensors; input_id++) {
-        auto shard_spec = input_tensors[input_id].shard_spec().value();
-        input_num_units_per_shard_height[input_id] = shard_spec.shape[0];
-        input_num_units_per_shard_width[input_id] = 1;
-        auto num_input_units = input_num_units_per_shard_height[input_id] * input_num_units_per_shard_width[input_id];
-        auto input_page_size = round_up_to_mul32(input_unit_size);
-        log_info("input_page_size: {}", input_page_size);
+        const auto shard_spec = input_tensors[input_id].shard_spec().value();
+        const uint32_t shard_height = shard_spec.shape[0];
+        const uint32_t shard_width = shard_spec.shape[1];
+        TT_FATAL(
+            shard_width % elements_per_page == 0,
+            "Input tensor width {} is not divisible by elements per page {}.",
+            shard_width,
+            elements_per_page);
+        input_num_pages_per_stick[input_id] = shard_width / elements_per_page;
+        input_num_sticks[input_id] = shard_height;
+        input_write_offsets[input_id] = curr_input_write_offset;
+
+        const uint32_t input_num_pages = input_num_pages_per_stick[input_id] * input_num_sticks[input_id];
         tt_metal::CircularBufferConfig input_cb_config =
-            tt_metal::CircularBufferConfig(num_input_units * input_page_size, {{input_id, cb_data_format}})
-                .set_page_size(input_id, input_page_size)
+            tt_metal::CircularBufferConfig(page_size * input_num_pages, {{input_id, cb_data_format}})
+                .set_page_size(input_id, page_size)
                 .set_globally_allocated_address(*input_tensors[input_id].buffer());
         cb_input[input_id] = tt_metal::CreateCircularBuffer(program, all_cores, input_cb_config);
         cb_ids[input_id] = input_id;
+
+        curr_input_write_offset +=
+            page_size * (is_height_concat ? input_num_pages : input_num_pages_per_stick[input_id]);
     }
 
     // output CB
-    uint32_t cb_dst_id = 16;
-    auto output_shard_spec = output.shard_spec().value();
-    auto num_output_units =
-        is_height_concat
-            ? (output_shard_spec.shape[0] * input_num_units_per_shard_width[0])
-            : (input_num_units_per_shard_height[0] * input_num_units_per_shard_width[0] * num_input_tensors);
-
-    log_info("num_output_units: {}", num_output_units);
-
-    auto output_page_size = round_up_to_mul32(input_unit_size);
+    const auto output_shard_spec = output.shard_spec().value();
+    const uint32_t output_shard_height = output_shard_spec.shape[0];
+    const uint32_t output_shard_width = output_shard_spec.shape[1];
+    TT_FATAL(
+        output_shard_width % elements_per_page == 0,
+        "Output tensor width {} is not divisible by elements per page {}.",
+        output_shard_width,
+        elements_per_page);
+    const uint32_t output_num_pages = output_shard_height * output_shard_width / elements_per_page;
     tt_metal::CircularBufferConfig output_cb_config =
-        tt_metal::CircularBufferConfig(num_output_units * output_page_size, {{cb_dst_id, cb_data_format}})
-            .set_page_size(cb_dst_id, output_page_size)
+        tt_metal::CircularBufferConfig(page_size * output_num_pages, {{cb_dst_id, cb_data_format}})
+            .set_page_size(cb_dst_id, page_size)
             .set_globally_allocated_address(*output.buffer());
     auto cb_output = tt_metal::CreateCircularBuffer(program, all_cores, output_cb_config);
 
-    uint32_t output_stick_size = output_shard_spec.shape[1] * output.element_size();
-
-    log_info("output_stick_size: {}", output_stick_size);
-
-    const auto input_0_shard_spec = input_tensors[0].shard_spec().value();
-    const auto input_1_shard_spec = input_tensors[1].shard_spec().value();
-    const auto input_0_stick_size = input_0_shard_spec.shape[1] * input_tensors[0].element_size();
-    const auto input_1_stick_size = input_1_shard_spec.shape[1] * input_tensors[1].element_size();
-    // const auto num_input_0_pages_per_risc = div_up(input_0_shard_spec.shape[0], 2);
-    // const auto num_input_1_pages_per_risc = div_up(input_0_shard_spec.shape[1], 2);
-    const auto num_input_0_pages_per_risc = input_0_shard_spec.shape[0];
-    const auto num_input_1_pages_per_risc = input_1_shard_spec.shape[0];
-    const uint32_t input_1_write_offset = input_0_stick_size * (is_height_concat ? input_0_shard_spec.shape[0] : 1);
+    const uint32_t output_stride = output_shard_width * element_size;
+    const auto input_0_num_sticks_per_risc = div_up(input_num_sticks[0], 2);
+    const auto input_1_num_sticks_per_risc = div_up(input_num_sticks[1], 2);
     const std::vector<uint32_t> compile_time_args_0 = {
         cb_dst_id,
-        input_0_stick_size,
-        input_1_stick_size,
-        output_stick_size,
-        input_1_write_offset,
-        num_input_0_pages_per_risc,
-        num_input_1_pages_per_risc,
+        page_size,
+        output_stride,
+        input_num_pages_per_stick[0],
+        input_0_num_sticks_per_risc,
+        input_write_offsets[0],
         0,
-        0,
-        0,
+        input_num_pages_per_stick[1],
+        input_1_num_sticks_per_risc,
+        input_write_offsets[1],
         0};
-
-    // const std::vector<uint32_t> compile_time_args_1 = {
-    //     cb_dst_id,
-    //     input_0_stick_size,
-    //     input_1_stick_size,
-    //     output_stick_size,
-    //     input_1_write_offset,
-    //     num_input_0_pages_per_risc,
-    //     num_input_1_pages_per_risc,
-    //     is_height_concat
-    //         ? (num_input_0_pages_per_risc * input_0_stick_size)
-    //         : (num_input_0_pages_per_risc * input_0_stick_size + num_input_1_pages_per_risc * input_1_stick_size),
-    //     is_height_concat
-    //         ? (num_input_1_pages_per_risc * input_1_stick_size)
-    //         : (num_input_0_pages_per_risc * input_0_stick_size + num_input_1_pages_per_risc * input_1_stick_size),
-    //     num_input_0_pages_per_risc * input_0_stick_size,
-    //     num_input_1_pages_per_risc * input_1_stick_size,
-    // };
+    const std::vector<uint32_t> compile_time_args_1 = {
+        cb_dst_id,
+        page_size,
+        output_stride,
+        input_num_pages_per_stick[0],
+        input_num_sticks[0] - input_0_num_sticks_per_risc,
+        input_write_offsets[0] + output_stride * input_0_num_sticks_per_risc,
+        page_size * input_num_pages_per_stick[0] * input_0_num_sticks_per_risc,
+        input_num_pages_per_stick[1],
+        input_num_sticks[1] - input_1_num_sticks_per_risc,
+        input_write_offsets[1] + output_stride * input_1_num_sticks_per_risc,
+        page_size * input_num_pages_per_stick[1] * input_1_num_sticks_per_risc};
 
     tt_metal::KernelHandle unary_reader_kernel_id = tt_metal::CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/experimental/data_movement/concat/device/kernels/dataflow/"
-        "reader_height_sharded_width_concat_two_tensors.cpp",
+        "reader_s2s_rm_tensor_concat.cpp",
         all_cores,
         tt_metal::ReaderDataMovementConfig(compile_time_args_0));
 
-    // tt_metal::KernelHandle unary_writer_kernel_id = tt_metal::CreateKernel(
-    //     program,
-    //     "ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/"
-    //     "reader_height_sharded_width_concat_two_tensors.cpp",
-    //     all_cores,
-    //     tt_metal::WriterDataMovementConfig(compile_time_args_1));
+    tt_metal::KernelHandle unary_writer_kernel_id = tt_metal::CreateKernel(
+        program,
+        "ttnn/cpp/ttnn/operations/experimental/data_movement/concat/device/kernels/dataflow/"
+        "reader_s2s_rm_tensor_concat.cpp",
+        all_cores,
+        tt_metal::WriterDataMovementConfig(compile_time_args_1));
 
     auto override_runtime_arguments_callback = [](const void *operation,
                                                   Program &program,
