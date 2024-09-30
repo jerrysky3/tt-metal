@@ -15,7 +15,7 @@ using namespace tt::tt_metal;
 
 int main(int argc, char **argv) {
     // get program/device
-    int device_id = 2;
+    int device_id = 0;
     Device *device = CreateDevice(device_id);
     CommandQueue& cq = device->command_queue();
     Program program = CreateProgram();
@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
     constexpr uint32_t N = 1;
     uint32_t num_values = M * N;
     tt::DataFormat cb_data_format = tt::DataFormat::Float16_b;
-    std::vector<bfloat16> src_vec(num_values, bfloat16(1.0f));
+    std::vector<bfloat16> src_vec(num_values, bfloat16(0.0f));
     // source vector - {2, 4, 6, ... , 28, 30, 32}
     for (uint32_t i = 0; i < src_vec.size(); i++) {
         src_vec[i] = bfloat16((i + 1) * 2);
