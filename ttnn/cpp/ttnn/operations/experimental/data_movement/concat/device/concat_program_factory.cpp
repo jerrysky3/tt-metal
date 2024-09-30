@@ -14,7 +14,7 @@ using namespace tt;
 
 namespace ttnn::operations::experimental::data_movement::detail {
 
-operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
+operation::ProgramWithCallbacks new_s2s_rm_concat_multi_core(
     const std::vector<Tensor> &input_tensors, uint32_t dim, Tensor &output) {
     TT_FATAL(dim == 2 || dim == 3, "Sharded concat RM only supports dim=2 or 3");
     const bool is_height_concat = dim == 2;
@@ -39,7 +39,7 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
     const tt::DataFormat cb_data_format = tt_metal::datatype_to_dataformat_converter(output.get_dtype());
     const auto all_cores = input_tensors[0].shard_spec().value().grid;
 
-    // input CBs
+    // Input CBs
     uint32_t curr_input_write_offset = 0;
     for (uint32_t input_id = 0; input_id < num_input_tensors; input_id++) {
         const auto shard_spec = input_tensors[input_id].shard_spec().value();
@@ -66,7 +66,7 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
             page_size * (is_height_concat ? input_num_pages : input_num_pages_per_stick[input_id]);
     }
 
-    // output CB
+    // Output CB
     const auto output_shard_spec = output.shard_spec().value();
     const uint32_t output_shard_height = output_shard_spec.shape[0];
     const uint32_t output_shard_width = output_shard_spec.shape[1];
@@ -83,52 +83,45 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
     auto cb_output = tt_metal::CreateCircularBuffer(program, all_cores, output_cb_config);
 
     const uint32_t output_stride = output_shard_width * element_size;
-    const auto input_0_num_sticks_per_risc = div_up(input_num_sticks[0], 2);
-    const auto input_1_num_sticks_per_risc = div_up(input_num_sticks[1], 2);
-    const std::vector<uint32_t> compile_time_args_0 = {
-        cb_dst_id,
-        page_size,
-        output_stride,
-        input_num_pages_per_stick[0],
-        input_0_num_sticks_per_risc,
-        input_write_offsets[0],
-        0,
-        input_num_pages_per_stick[1],
-        input_1_num_sticks_per_risc,
-        input_write_offsets[1],
-        0};
-    const std::vector<uint32_t> compile_time_args_1 = {
-        cb_dst_id,
-        page_size,
-        output_stride,
-        input_num_pages_per_stick[0],
-        input_num_sticks[0] - input_0_num_sticks_per_risc,
-        input_write_offsets[0] + output_stride * input_0_num_sticks_per_risc,
-        page_size * input_num_pages_per_stick[0] * input_0_num_sticks_per_risc,
-        input_num_pages_per_stick[1],
-        input_num_sticks[1] - input_1_num_sticks_per_risc,
-        input_write_offsets[1] + output_stride * input_1_num_sticks_per_risc,
-        page_size * input_num_pages_per_stick[1] * input_1_num_sticks_per_risc};
+    const std::vector<uint32_t> compile_time_args = {cb_dst_id, page_size, output_stride, num_input_tensors};
+
+    std::vector<uint32_t> runtime_args_0;
+    std::vector<uint32_t> runtime_args_1;
+    for (uint32_t input_id = 0; input_id < num_input_tensors; input_id++) {
+        const auto input_num_sticks_per_risc = div_up(input_num_sticks[input_id], 2);
+        runtime_args_0.push_back(input_num_pages_per_stick[input_id]);
+        runtime_args_0.push_back(input_num_sticks_per_risc);
+        runtime_args_0.push_back(input_write_offsets[input_id]);
+        runtime_args_0.push_back(0);
+        runtime_args_1.push_back(input_num_pages_per_stick[input_id]);
+        runtime_args_1.push_back(input_num_sticks[input_id] - input_num_sticks_per_risc);
+        runtime_args_1.push_back(input_write_offsets[input_id] + output_stride * input_num_sticks_per_risc);
+        runtime_args_1.push_back(page_size * input_num_pages_per_stick[input_id] * input_num_sticks_per_risc);
+    }
 
     tt_metal::KernelHandle unary_reader_kernel_id = tt_metal::CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/experimental/data_movement/concat/device/kernels/dataflow/"
         "reader_s2s_rm_tensor_concat.cpp",
         all_cores,
-        tt_metal::ReaderDataMovementConfig(compile_time_args_0));
+        tt_metal::ReaderDataMovementConfig(compile_time_args));
 
     tt_metal::KernelHandle unary_writer_kernel_id = tt_metal::CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/experimental/data_movement/concat/device/kernels/dataflow/"
         "reader_s2s_rm_tensor_concat.cpp",
         all_cores,
-        tt_metal::WriterDataMovementConfig(compile_time_args_1));
+        tt_metal::WriterDataMovementConfig(compile_time_args));
 
-    auto override_runtime_arguments_callback = [](const void *operation,
-                                                  Program &program,
-                                                  const std::vector<Tensor> &input_tensors,
-                                                  const std::vector<std::optional<const Tensor>> &,
-                                                  const std::vector<Tensor> &output_tensors) { ; };
+    tt_metal::SetRuntimeArgs(program, unary_reader_kernel_id, all_cores, runtime_args_0);
+    tt_metal::SetRuntimeArgs(program, unary_writer_kernel_id, all_cores, runtime_args_1);
+
+    // auto override_runtime_arguments_callback = [](const void *operation,
+    //                                               Program &program,
+    //                                               const std::vector<Tensor> &input_tensors,
+    //                                               const std::vector<std::optional<const Tensor>> &,
+    //                                               const std::vector<Tensor> &output_tensors) {};
+    auto override_runtime_arguments_callback = nullptr;
 
     return {.program = std::move(program), .override_runtime_arguments_callback = override_runtime_arguments_callback};
 }
@@ -463,12 +456,13 @@ operation::ProgramWithCallbacks s2i_rm_concat_multi_core(
 operation::ProgramWithCallbacks sharded_concat_multi_core(
     const std::vector<Tensor> &input_tensors, uint32_t dim, Tensor &output) {
     if (output.is_sharded()) {
-        if (input_tensors.size() == 2) {
-            return s2s_rm_concat_two_tensors_multi_core(input_tensors, dim, output);
+        return new_s2s_rm_concat_multi_core(input_tensors, dim, output);
+        // if (input_tensors.size() == 2) {
+        //     return s2s_rm_concat_two_tensors_multi_core(input_tensors, dim, output);
 
-        } else {
-            return s2s_rm_concat_multi_core(input_tensors, dim, output);
-        }
+        // } else {
+        //     return s2s_rm_concat_multi_core(input_tensors, dim, output);
+        // }
     } else {
         return s2i_rm_concat_multi_core(input_tensors, dim, output);
     }
