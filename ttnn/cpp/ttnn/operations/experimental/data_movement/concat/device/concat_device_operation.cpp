@@ -58,13 +58,13 @@ void ConcatDeviceOperation::validate(const std::vector<Tensor> &input_tensors) c
             TT_FATAL(
                 in_ref.memory_config().memory_layout != TensorMemoryLayout::BLOCK_SHARDED,
                 "Block sharded inputs are not supported");
-            TT_FATAL(
-                in_ref.memory_config().memory_layout != TensorMemoryLayout::WIDTH_SHARDED,
-                "Width sharded inputs are not supported");
+            // TT_FATAL(
+            //     in_ref.memory_config().memory_layout != TensorMemoryLayout::WIDTH_SHARDED,
+            //     "Width sharded inputs are not supported");
         }
     }
     if (shard_first) {
-        TT_FATAL(this->dim == shape_first.rank() - 1, "Only width concat on sharded tensors");
+        TT_FATAL(this->dim >= shape_first.rank() - 2, "Only width and height concat on sharded tensors");
         TT_FATAL(this->output_mem_config.is_sharded(), "Output must be sharded if input is sharded");
     }
 }

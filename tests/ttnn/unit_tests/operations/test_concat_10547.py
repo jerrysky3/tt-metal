@@ -21,18 +21,18 @@ def main(device):
     x_t = ttnn.to_memory_config(x, memory_config=input_shard_config, dtype=ttnn.bfloat16)
 
     output_shard_config = ttnn.create_sharded_memory_config(
-        shape=[1, 1, 32, 64],
+        shape=[1, 1, 64, 32],
         core_grid=ttnn.CoreGrid(y=2, x=1),
         strategy=ttnn.ShardStrategy.WIDTH,
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=False,
     )
-    y_t = ttnn.experimental.concat([x_t, x_t], dim=3, memory_config=output_shard_config)
+    y_t = ttnn.experimental.concat([x_t, x_t], dim=2, memory_config=output_shard_config)
     output_data = ttnn.to_torch(y_t)
 
     print(input_data, input_data.shape)
     print(output_data, output_data.shape)
-    print(torch.allclose(torch.concat([input_data, input_data], dim=3), output_data))
+    print(torch.allclose(torch.concat([input_data, input_data], dim=2), output_data))
 
 
 if __name__ == "__main__":

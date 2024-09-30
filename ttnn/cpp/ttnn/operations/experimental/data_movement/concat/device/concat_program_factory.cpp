@@ -16,7 +16,8 @@ namespace ttnn::operations::experimental::data_movement::detail {
 
 operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
     const std::vector<Tensor> &input_tensors, uint32_t dim, Tensor &output) {
-    TT_FATAL(dim == 3, "Sharded concat RM only supports dim=3");
+    TT_FATAL(dim == 2 || dim == 3, "Sharded concat RM only supports dim=2 or 3");
+    const bool is_height_concat = dim == 2;
 
     tt_metal::Program program = tt_metal::CreateProgram();
 
@@ -38,6 +39,9 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
 
     vector<uint32_t> cb_ids(num_input_tensors);
     uint32_t input_unit_size = input_tensors[0].shard_spec().value().shape[1] * input_tensors[0].element_size();
+
+    log_info("input_unit_size: {}", input_unit_size);
+
     // input CBs
     for (uint32_t input_id = 0; input_id < num_input_tensors; input_id++) {
         auto shard_spec = input_tensors[input_id].shard_spec().value();
@@ -45,6 +49,7 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
         input_num_units_per_shard_width[input_id] = 1;
         auto num_input_units = input_num_units_per_shard_height[input_id] * input_num_units_per_shard_width[input_id];
         auto input_page_size = round_up_to_mul32(input_unit_size);
+        log_info("input_page_size: {}", input_page_size);
         tt_metal::CircularBufferConfig input_cb_config =
             tt_metal::CircularBufferConfig(num_input_units * input_page_size, {{input_id, cb_data_format}})
                 .set_page_size(input_id, input_page_size)
@@ -55,9 +60,14 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
 
     // output CB
     uint32_t cb_dst_id = 16;
+    auto output_shard_spec = output.shard_spec().value();
     auto num_output_units =
-        input_num_units_per_shard_height[0] * input_num_units_per_shard_width[0] * num_input_tensors;
-    uint32_t intermed_cb_id = 8;
+        is_height_concat
+            ? (output_shard_spec.shape[0] * input_num_units_per_shard_width[0])
+            : (input_num_units_per_shard_height[0] * input_num_units_per_shard_width[0] * num_input_tensors);
+
+    log_info("num_output_units: {}", num_output_units);
+
     auto output_page_size = round_up_to_mul32(input_unit_size);
     tt_metal::CircularBufferConfig output_cb_config =
         tt_metal::CircularBufferConfig(num_output_units * output_page_size, {{cb_dst_id, cb_data_format}})
@@ -65,65 +75,69 @@ operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
             .set_globally_allocated_address(*output.buffer());
     auto cb_output = tt_metal::CreateCircularBuffer(program, all_cores, output_cb_config);
 
-    auto output_shard_spec = output.shard_spec().value();
     uint32_t output_stick_size = output_shard_spec.shape[1] * output.element_size();
 
-    auto input_0_shard_spec = input_tensors[0].shard_spec().value();
-    auto input_1_shard_spec = input_tensors[1].shard_spec().value();
-    auto input_0_stick_size = input_0_shard_spec.shape[1] * input_tensors[0].element_size();
-    auto input_1_stick_size = input_1_shard_spec.shape[1] * input_tensors[1].element_size();
-    auto input_0_stride = output_stick_size - input_0_stick_size;
-    auto input_1_stride = output_stick_size - input_1_stick_size;
-    uint32_t num_output_rows_per_core = div_up(num_output_rows, all_cores.num_cores());
-    auto num_pages_per_risc = div_up(num_output_rows_per_core, 2);
-    std::vector<uint32_t> compile_time_args_0 = {
+    log_info("output_stick_size: {}", output_stick_size);
+
+    const auto input_0_shard_spec = input_tensors[0].shard_spec().value();
+    const auto input_1_shard_spec = input_tensors[1].shard_spec().value();
+    const auto input_0_stick_size = input_0_shard_spec.shape[1] * input_tensors[0].element_size();
+    const auto input_1_stick_size = input_1_shard_spec.shape[1] * input_tensors[1].element_size();
+    // const auto num_input_0_pages_per_risc = div_up(input_0_shard_spec.shape[0], 2);
+    // const auto num_input_1_pages_per_risc = div_up(input_0_shard_spec.shape[1], 2);
+    const auto num_input_0_pages_per_risc = input_0_shard_spec.shape[0];
+    const auto num_input_1_pages_per_risc = input_1_shard_spec.shape[0];
+    const uint32_t input_1_write_offset = input_0_stick_size * (is_height_concat ? input_0_shard_spec.shape[0] : 1);
+    const std::vector<uint32_t> compile_time_args_0 = {
         cb_dst_id,
         input_0_stick_size,
         input_1_stick_size,
-        input_0_stride,
-        input_1_stride,
-        num_output_rows_per_core * num_input_tensors,
+        output_stick_size,
+        input_1_write_offset,
+        num_input_0_pages_per_risc,
+        num_input_1_pages_per_risc,
         0,
-        num_pages_per_risc,
         0,
         0,
         0};
 
-    std::vector<uint32_t> compile_time_args_1 = {
-        cb_dst_id,
-        input_0_stick_size,
-        input_1_stick_size,
-        input_0_stride,
-        input_1_stride,
-        num_output_rows_per_core * num_input_tensors,
-        num_pages_per_risc,
-        num_output_rows_per_core,
-        num_pages_per_risc * output_stick_size,
-        num_pages_per_risc * input_0_stick_size,
-        num_pages_per_risc * input_1_stick_size,
-    };
+    // const std::vector<uint32_t> compile_time_args_1 = {
+    //     cb_dst_id,
+    //     input_0_stick_size,
+    //     input_1_stick_size,
+    //     output_stick_size,
+    //     input_1_write_offset,
+    //     num_input_0_pages_per_risc,
+    //     num_input_1_pages_per_risc,
+    //     is_height_concat
+    //         ? (num_input_0_pages_per_risc * input_0_stick_size)
+    //         : (num_input_0_pages_per_risc * input_0_stick_size + num_input_1_pages_per_risc * input_1_stick_size),
+    //     is_height_concat
+    //         ? (num_input_1_pages_per_risc * input_1_stick_size)
+    //         : (num_input_0_pages_per_risc * input_0_stick_size + num_input_1_pages_per_risc * input_1_stick_size),
+    //     num_input_0_pages_per_risc * input_0_stick_size,
+    //     num_input_1_pages_per_risc * input_1_stick_size,
+    // };
 
     tt_metal::KernelHandle unary_reader_kernel_id = tt_metal::CreateKernel(
         program,
-        "ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/"
+        "ttnn/cpp/ttnn/operations/experimental/data_movement/concat/device/kernels/dataflow/"
         "reader_height_sharded_width_concat_two_tensors.cpp",
         all_cores,
         tt_metal::ReaderDataMovementConfig(compile_time_args_0));
 
-    tt_metal::KernelHandle unary_writer_kernel_id = tt_metal::CreateKernel(
-        program,
-        "ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/"
-        "reader_height_sharded_width_concat_two_tensors.cpp",
-        all_cores,
-        tt_metal::WriterDataMovementConfig(compile_time_args_1));
+    // tt_metal::KernelHandle unary_writer_kernel_id = tt_metal::CreateKernel(
+    //     program,
+    //     "ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/"
+    //     "reader_height_sharded_width_concat_two_tensors.cpp",
+    //     all_cores,
+    //     tt_metal::WriterDataMovementConfig(compile_time_args_1));
 
-    auto override_runtime_arguments_callback =
-        [unary_reader_kernel_id, unary_writer_kernel_id, all_cores, num_input_tensors](
-            const void *operation,
-            Program &program,
-            const std::vector<Tensor> &input_tensors,
-            const std::vector<std::optional<const Tensor>> &,
-            const std::vector<Tensor> &output_tensors) { ; };
+    auto override_runtime_arguments_callback = [](const void *operation,
+                                                  Program &program,
+                                                  const std::vector<Tensor> &input_tensors,
+                                                  const std::vector<std::optional<const Tensor>> &,
+                                                  const std::vector<Tensor> &output_tensors) { ; };
 
     return {.program = std::move(program), .override_runtime_arguments_callback = override_runtime_arguments_callback};
 }
