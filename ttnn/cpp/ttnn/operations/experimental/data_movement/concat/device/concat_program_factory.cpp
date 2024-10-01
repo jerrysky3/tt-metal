@@ -4,6 +4,9 @@
 
 #include "ttnn/cpp/ttnn/operations/experimental/data_movement/concat/device/concat_program_factory.hpp"
 
+#include <algorithm>
+#include <numeric>
+
 #include "tt_metal/common/work_split.hpp"
 #include "tt_metal/detail/util.hpp"
 #include "tt_metal/host_api.hpp"
@@ -12,9 +15,23 @@
 using namespace tt::constants;
 using namespace tt;
 
+namespace {
+
+uint32_t find_greatest_common_page_size(std::vector<uint32_t> &stick_sizes, uint32_t alignment) {
+    TT_FATAL(stick_sizes.size() > 0, "Need at least one stick size to find page size");
+    uint32_t page_size = align(stick_sizes[0], alignment);
+    for (size_t idx = 1; idx < stick_sizes.size(); idx++) {
+        const uint32_t padded_stick_size = align(stick_sizes[idx], alignment);
+        page_size = std::gcd(page_size, padded_stick_size);
+    }
+    return page_size;
+}
+
+}  // namespace
+
 namespace ttnn::operations::experimental::data_movement::detail {
 
-operation::ProgramWithCallbacks new_s2s_rm_concat_multi_core(
+operation::ProgramWithCallbacks experimental_s2s_rm_concat_multi_core(
     const std::vector<Tensor> &input_tensors, uint32_t dim, Tensor &output) {
     TT_FATAL(dim == 2 || dim == 3, "Sharded concat RM only supports dim=2 or 3");
     const bool is_height_concat = dim == 2;
@@ -24,19 +41,28 @@ operation::ProgramWithCallbacks new_s2s_rm_concat_multi_core(
 
     const uint32_t num_input_tensors = input_tensors.size();
     const uint32_t cb_dst_id = 16;
-    TT_FATAL(num_input_tensors <= cb_dst_id, "Not enough circuit buffer for {} inputs.", num_input_tensors);
-    // TODO(#TODO): Calculate the gcd page size.
-    const uint32_t page_size = 32;
-    const uint32_t element_size = output.element_size();
+    TT_FATAL(num_input_tensors <= cb_dst_id, "Not enough circular buffer for {} inputs.", num_input_tensors);
+
+    // Assume inputs and output have the same element type and alignment.
+    const uint32_t element_size = input_tensors[0].element_size();
+    const uint32_t alignment = input_tensors[0].buffer()->alignment();
+
+    std::vector<uint32_t> all_stick_sizes;
+    all_stick_sizes.push_back(output.shard_spec().value().shape[1]);
+    std::transform(
+        input_tensors.begin(), input_tensors.end(), std::back_inserter(all_stick_sizes), [](const Tensor &tensor) {
+            return tensor.element_size() * tensor.shard_spec().value().shape[1];
+        });
+    const uint32_t page_size = find_greatest_common_page_size(all_stick_sizes, alignment);
     const uint32_t elements_per_page = page_size / element_size;
 
-    vector<CBHandle> cb_input(num_input_tensors);
-    vector<uint32_t> cb_ids(num_input_tensors);
+    vector<CBHandle> cb_inputs(num_input_tensors);
     vector<uint32_t> input_num_pages_per_stick(num_input_tensors);
     vector<uint32_t> input_num_sticks(num_input_tensors);
     vector<uint32_t> input_write_offsets(num_input_tensors);
 
     const tt::DataFormat cb_data_format = tt_metal::datatype_to_dataformat_converter(output.get_dtype());
+    // Assume inputs and output have the same sharding grid.
     const auto all_cores = input_tensors[0].shard_spec().value().grid;
 
     // Input CBs
@@ -45,22 +71,16 @@ operation::ProgramWithCallbacks new_s2s_rm_concat_multi_core(
         const auto shard_spec = input_tensors[input_id].shard_spec().value();
         const uint32_t shard_height = shard_spec.shape[0];
         const uint32_t shard_width = shard_spec.shape[1];
-        TT_FATAL(
-            shard_width % elements_per_page == 0,
-            "Input tensor width {} is not divisible by elements per page {}.",
-            shard_width,
-            elements_per_page);
-        input_num_pages_per_stick[input_id] = shard_width / elements_per_page;
+        input_num_pages_per_stick[input_id] = div_up(shard_width, elements_per_page);
         input_num_sticks[input_id] = shard_height;
         input_write_offsets[input_id] = curr_input_write_offset;
 
         const uint32_t input_num_pages = input_num_pages_per_stick[input_id] * input_num_sticks[input_id];
-        tt_metal::CircularBufferConfig input_cb_config =
+        const tt_metal::CircularBufferConfig input_cb_config =
             tt_metal::CircularBufferConfig(page_size * input_num_pages, {{input_id, cb_data_format}})
                 .set_page_size(input_id, page_size)
                 .set_globally_allocated_address(*input_tensors[input_id].buffer());
-        cb_input[input_id] = tt_metal::CreateCircularBuffer(program, all_cores, input_cb_config);
-        cb_ids[input_id] = input_id;
+        cb_inputs[input_id] = tt_metal::CreateCircularBuffer(program, all_cores, input_cb_config);
 
         curr_input_write_offset +=
             page_size * (is_height_concat ? input_num_pages : input_num_pages_per_stick[input_id]);
@@ -70,19 +90,15 @@ operation::ProgramWithCallbacks new_s2s_rm_concat_multi_core(
     const auto output_shard_spec = output.shard_spec().value();
     const uint32_t output_shard_height = output_shard_spec.shape[0];
     const uint32_t output_shard_width = output_shard_spec.shape[1];
-    TT_FATAL(
-        output_shard_width % elements_per_page == 0,
-        "Output tensor width {} is not divisible by elements per page {}.",
-        output_shard_width,
-        elements_per_page);
-    const uint32_t output_num_pages = output_shard_height * output_shard_width / elements_per_page;
-    tt_metal::CircularBufferConfig output_cb_config =
-        tt_metal::CircularBufferConfig(page_size * output_num_pages, {{cb_dst_id, cb_data_format}})
+    const uint32_t output_num_pages_per_stick = div_up(output_shard_width, elements_per_page);
+    const tt_metal::CircularBufferConfig output_cb_config =
+        tt_metal::CircularBufferConfig(
+            page_size * output_shard_height * output_num_pages_per_stick, {{cb_dst_id, cb_data_format}})
             .set_page_size(cb_dst_id, page_size)
             .set_globally_allocated_address(*output.buffer());
     auto cb_output = tt_metal::CreateCircularBuffer(program, all_cores, output_cb_config);
 
-    const uint32_t output_stride = output_shard_width * element_size;
+    const uint32_t output_stride = page_size * output_num_pages_per_stick;
     const std::vector<uint32_t> compile_time_args = {cb_dst_id, page_size, output_stride, num_input_tensors};
 
     std::vector<uint32_t> runtime_args_0;
@@ -116,13 +132,17 @@ operation::ProgramWithCallbacks new_s2s_rm_concat_multi_core(
     tt_metal::SetRuntimeArgs(program, unary_reader_kernel_id, all_cores, runtime_args_0);
     tt_metal::SetRuntimeArgs(program, unary_writer_kernel_id, all_cores, runtime_args_1);
 
-    // auto override_runtime_arguments_callback = [](const void *operation,
-    //                                               Program &program,
-    //                                               const std::vector<Tensor> &input_tensors,
-    //                                               const std::vector<std::optional<const Tensor>> &,
-    //                                               const std::vector<Tensor> &output_tensors) {};
-    auto override_runtime_arguments_callback = nullptr;
-
+    auto override_runtime_arguments_callback = [num_input_tensors, cb_dst_id, cb_inputs, cb_output](
+                                                   const void *operation,
+                                                   Program &program,
+                                                   const std::vector<Tensor> &input_tensors,
+                                                   const std::vector<std::optional<const Tensor>> &,
+                                                   const std::vector<Tensor> &output_tensors) {
+        for (uint32_t input_id = 0; input_id < num_input_tensors; input_id++) {
+            UpdateDynamicCircularBufferAddress(program, cb_inputs[input_id], *input_tensors[input_id].buffer());
+        }
+        UpdateDynamicCircularBufferAddress(program, cb_output, *output_tensors[0].buffer());
+    };
     return {.program = std::move(program), .override_runtime_arguments_callback = override_runtime_arguments_callback};
 }
 
@@ -456,7 +476,7 @@ operation::ProgramWithCallbacks s2i_rm_concat_multi_core(
 operation::ProgramWithCallbacks sharded_concat_multi_core(
     const std::vector<Tensor> &input_tensors, uint32_t dim, Tensor &output) {
     if (output.is_sharded()) {
-        return new_s2s_rm_concat_multi_core(input_tensors, dim, output);
+        return experimental_s2s_rm_concat_multi_core(input_tensors, dim, output);
         // if (input_tensors.size() == 2) {
         //     return s2s_rm_concat_two_tensors_multi_core(input_tensors, dim, output);
 
